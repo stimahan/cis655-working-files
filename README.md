@@ -924,6 +924,13 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     <div id="reviewBookResult"></div>
   </div>
 
+  <!-- My Books Section -->
+  <div class="section">
+    <h2>My Books</h2>
+    <button onclick="loadMyBooks()">View My Books</button>
+    <div id="myBooksList"></div>
+  </div>  
+
   <!-- Metadata Recommendation Section -->
   <div class="section">
     <h2>Find Book Recommendations</h2>
@@ -1019,6 +1026,38 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
       });
     }
 
+    function loadMyBooks() {
+      fetch(`/user_books/1`)
+        .then(res => res.json())
+        .then(books => {
+          const container = document.getElementById("myBooksList");
+          container.innerHTML = "";
+          if (!books.length) return container.innerHTML = "<p>No books found.</p>";
+
+          books.forEach(book => {
+            const div = document.createElement("div");
+            div.className = "book";
+            div.innerHTML = `
+              <img src="${book.image_small || '/static/placeholder.png'}" alt="cover">
+              <div>
+                <strong>${book.title}</strong><br>
+                <em>${book.authors}</em><br>
+                <p><b>Rating:</b> ${book.rating || "N/A"}</p>
+                <p><b>Status:</b> ${book.status || "N/A"}</p>
+                <p><b>Progress:</b> ${book.progress || "N/A"}%</p>
+                <p><b>Notes:</b> ${book.notes || ""}</p>
+              </div>
+            `;
+            container.appendChild(div);
+          });
+        })
+        .catch(err => {
+          console.error("Error loading books:", err);
+          alert("Failed to load reviewed books.");
+        });
+    }
+
+
     function getMetadataRecommendations() {
       const title = document.getElementById('recTitle').value;
       const authors = document.getElementById('recAuthors').value;
@@ -1046,6 +1085,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
             <div>
               <strong>${book.title}</strong><br>
               <em>${book.authors}</em><br>
+              👍 ${book.thumbs_up || 0} 👎 ${book.thumbs_down || 0} ⭐ ${book.avg_rating?.toFixed(1) || "N/A"}<br>
               <button onclick="rateBook('${book.isbn_10}', '${book.title}', '${book.authors}', 'like')">👍</button>
               <button onclick="rateBook('${book.isbn_10}', '${book.title}', '${book.authors}', 'dislike')">👎</button><br>
               ${book.web_reader_link ? `<a href="${book.web_reader_link}" target="_blank">Read</a>` : ''}
@@ -1344,7 +1384,7 @@ BUCKET_NAME = "k8-books-bucket"
 SOURCE_FILE = "k8_books_new.csv"
 TARGET_FILE = "k8_books_clean.csv"
 
-# Expected columns (22)
+# Final expected 22 columns (after dropping 'maturity_rating')
 COLUMNS = [
     "title", "authors", "publisher", "published_date", "description",
     "isbn_10", "isbn_13", "reading_mode_text", "reading_mode_image", "page_count",
@@ -1356,7 +1396,7 @@ COLUMNS = [
 client = storage.Client()
 bucket = client.bucket(BUCKET_NAME)
 
-# Download the file
+# Download the raw file from GCS
 blob = bucket.blob(SOURCE_FILE)
 blob.download_to_filename("temp_books.csv")
 
@@ -1364,19 +1404,29 @@ blob.download_to_filename("temp_books.csv")
 with open("temp_books.csv", "r", encoding="utf-8") as infile, open("k8_books_clean.csv", "w", encoding="utf-8", newline='') as outfile:
     reader = csv.reader(infile)
     writer = csv.writer(outfile)
-    writer.writerow(COLUMNS)
 
-    for row in reader:
-        if len(row) == 23:  # has 'id' column
-            row = row[1:]
-        if len(row) == 22 and row[0].strip():  # must have a title
+    writer.writerow(COLUMNS)  # Write header
+
+    for i, row in enumerate(reader):
+        # Skip original header
+        if i == 0 and "title" in row[0].lower():
+            continue
+        
+        # Remove ID column if present (assume first column is ID if row is too long)
+        if len(row) == 24:
+            row = row[1:]  # Remove ID
+        if len(row) == 23:
+            del row[11]  # Remove 'maturity_rating'
+
+        # Only keep rows that now match our column list and have a title
+        if len(row) == 22 and row[0].strip():
             writer.writerow(row)
 
-# Upload cleaned version
-clean_blob = bucket.blob("k8_books_clean.csv")
+# Upload cleaned file to GCS
+clean_blob = bucket.blob(TARGET_FILE)
 clean_blob.upload_from_filename("k8_books_clean.csv")
 
-print("Cleaned file uploaded as k8_books_clean.csv")
+print(" Cleaned file uploaded as", TARGET_FILE)
 ```
 
 # chatbot.py
@@ -1406,7 +1456,7 @@ def ask_chatbot(prompt: str) -> str:
         return "Sorry, I had trouble answering that."
 ```
 
-# requirements.txt
+# requirements.txt for book-api
 ```
 annotated-types==0.7.0
 anyio==4.9.0
@@ -1474,6 +1524,7 @@ uvicorn==0.34.0
 Werkzeug==3.1.3
 wrapt==1.17.2
 zipp==3.21.0
+google-cloud-sql-connector[pg8000]
 ```
 
 # book_embeddings_schema.json
@@ -1595,4 +1646,395 @@ def append_books(request):
         return jsonify({"error": str(e)}), 500
 ```
 
+# main.py in book-api
+```
+from append_books_from_gcs import append_books
+```
 
+## rate book function
+
+# requirements.txt in rate_book_function
+```
+psycopg2-binary
+google-cloud-storage
+google-cloud-pubsub
+google-cloud-aiplatform
+```
+
+# main.py in rate_book_function
+```
+import base64
+import json
+import os
+from google.cloud import storage
+import psycopg2
+
+DB_USER = "postgres"
+DB_PASS = "stimac-cis655-final"
+DB_NAME = "book_recommendations_db"
+DB_HOST = "/cloudsql/book-recommendations-456120:us-central1:book-recs-db"
+
+def get_conn():
+    return psycopg2.connect(
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+        host=DB_HOST
+    )
+
+def entry_point(event, context):
+    data = json.loads(base64.b64decode(event["data"]).decode("utf-8"))
+
+    isbn_10 = data.get("isbn_10")
+    title   = data["title"]
+    author  = data["author"]
+    user_id = data["user_id"]
+    rating  = data.get("rating")
+    status  = data.get("status")
+    progress = data.get("progress")
+    notes   = data.get("notes")
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        # 1. Insert book if it doesn't exist
+        cur.execute("""
+            SELECT 1 FROM books WHERE isbn_10 = %s
+        """, (isbn_10,))
+        if not cur.fetchone():
+            cur.execute("""
+                INSERT INTO books (title, authors, isbn_10)
+                VALUES (%s, %s, %s)
+            """, (title, author, isbn_10))
+            print(f" Added new book: {title}")
+
+        # 2. Insert into user_books
+        cur.execute("""
+            INSERT INTO user_books (user_id, title, author, isbn_10, rating, status, progress, notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (user_id, title, author, isbn_10, rating, status, progress, notes))
+        print(f" Added rating: {rating} for user {user_id}")
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        print(f" Error: {e}")
+    finally:
+        cur.close()
+        conn.close()
+```
+
+## BigQuery SQL Query 
+```
+DECLARE target_isbn STRING DEFAULT "0375866116";
+DECLARE target_title STRING DEFAULT NULL;
+DECLARE target_authors STRING DEFAULT NULL;
+DECLARE target_grade STRING DEFAULT NULL;
+DECLARE target_keyword STRING DEFAULT NULL;
+
+WITH target AS (
+  SELECT embedding
+  FROM `book-recommendations-456120.book_recs.book_embeddings`
+  WHERE (
+    (target_isbn IS NOT NULL AND isbn_10 = target_isbn) OR
+    (target_title IS NOT NULL AND LOWER(title) = LOWER(target_title)) OR
+    (target_authors IS NOT NULL AND LOWER(authors) = LOWER(target_authors)) OR
+    (target_grade IS NOT NULL AND grade = target_grade) OR
+    (target_keyword IS NOT NULL AND (
+      LOWER(title) LIKE CONCAT('%', LOWER(target_keyword), '%') OR
+      LOWER(authors) LIKE CONCAT('%', LOWER(target_keyword), '%') OR
+      LOWER(description) LIKE CONCAT('%', LOWER(target_keyword), '%')
+    ))
+  )
+  LIMIT 1
+),
+
+scored AS (
+  SELECT
+    b2.isbn_10,
+    b2.title,
+    b2.authors,
+    b2.grade,
+    b2.image_small,
+    b2.web_reader_link,
+    b2.thumbs_up,
+    b2.thumbs_down,
+    (
+      SELECT SUM(e1 * e2)
+      FROM UNNEST(b2.embedding) AS e1 WITH OFFSET i
+      JOIN UNNEST(target.embedding) AS e2 WITH OFFSET j
+      ON i = j
+    ) /
+    (
+      SQRT((SELECT SUM(POW(val, 2)) FROM UNNEST(b2.embedding) AS val)) *
+      SQRT((SELECT SUM(POW(val2, 2)) FROM UNNEST(target.embedding) AS val2))
+    ) AS similarity
+  FROM `book-recommendations-456120.book_recs.book_embeddings` b2, target
+  WHERE b2.embedding IS NOT NULL
+    AND (
+      target_isbn IS NULL OR b2.isbn_10 != target_isbn
+    )
+)
+
+SELECT *
+FROM scored
+ORDER BY similarity DESC
+LIMIT 10;
+```
+
+
+## Google Books API Colab
+# Create books.csv
+```
+import requests
+import csv
+import time
+
+API_KEY = "AIzaSyAF9e-dplvn7hy3ObmK60XV-cpht4pMeeY"
+
+GRADE_QUERIES = {
+    "K": "kindergarten books",
+    "1": "grade 1 books",
+    "2": "grade 2 books",
+    "3": "grade 3 books",
+    "4": "grade 4 books",
+    "5": "grade 5 books",
+    "6": "grade 6 books",
+    "7": "grade 7 books",
+    "8": "grade 8 books"
+}
+
+def fetch_books(query, grade, max_results=40):
+    url = f"https://www.googleapis.com/books/v1/volumes?q={query}&maxResults={max_results}&printType=books&langRestrict=en&key={API_KEY}"
+    response = requests.get(url)
+    books = response.json().get("items", [])
+    book_data = []
+
+    for book in books:
+        info = book.get("volumeInfo", {})
+        sale = book.get("saleInfo", {})
+        access = book.get("accessInfo", {})
+
+        title = info.get("title", "")
+        authors = ", ".join(info.get("authors", []))
+        publisher = info.get("publisher", "")
+        published_date = info.get("publishedDate", "")
+        description = info.get("description", "")
+        page_count = info.get("pageCount", "")
+        categories = ", ".join(info.get("categories", []))
+        maturity_rating = info.get("maturityRating", "")
+        language = info.get("language", "")
+        reading_mode_text = info.get("readingModes", {}).get("text", "")
+        reading_mode_image = info.get("readingModes", {}).get("image", "")
+
+        image_small = info.get("imageLinks", {}).get("smallThumbnail", "")
+        image_large = info.get("imageLinks", {}).get("thumbnail", "")
+
+        # ISBNs
+        isbn_10 = ""
+        isbn_13 = ""
+        for identifier in info.get("industryIdentifiers", []):
+            if identifier["type"] == "ISBN_10":
+                isbn_10 = identifier["identifier"]
+            elif identifier["type"] == "ISBN_13":
+                isbn_13 = identifier["identifier"]
+
+        # Sale Info
+        country = sale.get("country", "")
+        list_price_amount = sale.get("listPrice", {}).get("amount", "")
+        list_price_currency = sale.get("listPrice", {}).get("currencyCode", "")
+        buy_link = sale.get("buyLink", "")
+
+        # Access Info
+        web_reader_link = access.get("webReaderLink", "")
+        embeddable = access.get("embeddable", "")
+
+        book_data.append([
+            title, authors, publisher, published_date, description,
+            isbn_10, isbn_13,
+            reading_mode_text, reading_mode_image, page_count,
+            categories, maturity_rating,
+            image_small, image_large,
+            language, country,
+            list_price_amount, list_price_currency,
+            buy_link, web_reader_link, embeddable,
+            grade
+        ])
+
+    return book_data
+
+def save_to_csv(data, filename="k8_books_40.csv"):
+    headers = [
+        "Title", "Authors", "Publisher", "Published Date", "Description",
+        "ISBN_10", "ISBN_13",
+        "ReadingMode_Text", "ReadingMode_Image", "PageCount",
+        "Categories", "MaturityRating",
+        "Image_Small", "Image_Large",
+        "Language", "Sale_Country",
+        "ListPrice_Amount", "ListPrice_Currency",
+        "BuyLink", "WebReaderLink", "Embeddable",
+        "Grade"
+    ]
+    with open(filename, mode='w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(headers)
+        writer.writerows(data)
+
+# Run the scraping process
+all_books = []
+for grade, query in GRADE_QUERIES.items():
+    print(f"📚 Fetching books for Grade {grade}...")
+    books = fetch_books(query, grade)
+    all_books.extend(books)
+    time.sleep(100)  # To avoid rate limits
+
+save_to_csv(all_books)
+print(" CSV saved as k8_books_40.csv")
+
+```
+
+# make books.csv bigger and bypass query limits
+```
+import requests
+import csv
+import time
+import os
+
+API_KEY = "AIzaSyAF9e-dplvn7hy3ObmK60XV-cpht4pMeeY"
+
+GRADE_QUERIES = {
+    "K": "kindergarten books",
+    "1": "grade 1 books",
+    "2": "grade 2 books",
+    "3": "grade 3 books",
+    "4": "grade 4 books",
+    "5": "grade 5 books",
+    "6": "grade 6 books",
+    "7": "grade 7 books",
+    "8": "grade 8 books"
+}
+
+EXISTING_FILE = "books.csv"
+NEW_FILE = "k8_books_new.csv"
+
+# Step 1: Load existing identifiers (title + ISBNs)
+existing_identifiers = set()
+if os.path.exists(EXISTING_FILE):
+    with open(EXISTING_FILE, mode='r', encoding='utf-8') as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            title = row.get("title", "").strip().lower()
+            isbn_10 = row.get("isbn_10", "").strip()
+            isbn_13 = row.get("isbn_13", "").strip()
+            if title:
+                existing_identifiers.add(title)
+            if isbn_10:
+                existing_identifiers.add(isbn_10)
+            if isbn_13:
+                existing_identifiers.add(isbn_13)
+
+def fetch_books(query, grade, start_index=0, max_results=40):
+    url = (
+        f"https://www.googleapis.com/books/v1/volumes?"
+        f"q={query}&startIndex={start_index}&maxResults={max_results}&printType=books"
+        f"&langRestrict=en&key={API_KEY}"
+    )
+    response = requests.get(url)
+    books = response.json().get("items", [])
+    book_data = []
+
+    for book in books:
+        info = book.get("volumeInfo", {})
+        sale = book.get("saleInfo", {})
+        access = book.get("accessInfo", {})
+
+        title = info.get("title", "").strip()
+        title_key = title.lower()
+
+        isbn_10 = ""
+        isbn_13 = ""
+        for identifier in info.get("industryIdentifiers", []):
+            if identifier["type"] == "ISBN_10":
+                isbn_10 = identifier["identifier"]
+            elif identifier["type"] == "ISBN_13":
+                isbn_13 = identifier["identifier"]
+
+        # Duplicate check
+        if (
+            title_key in existing_identifiers or
+            (isbn_10 and isbn_10 in existing_identifiers) or
+            (isbn_13 and isbn_13 in existing_identifiers)
+        ):
+            continue
+
+        authors = ", ".join(info.get("authors", []))
+        publisher = info.get("publisher", "")
+        published_date = info.get("publishedDate", "")
+        description = info.get("description", "")
+        page_count = info.get("pageCount", "")
+        categories = ", ".join(info.get("categories", []))
+        maturity_rating = info.get("maturityRating", "")
+        language = info.get("language", "")
+        reading_mode_text = info.get("readingModes", {}).get("text", "")
+        reading_mode_image = info.get("readingModes", {}).get("image", "")
+        image_small = info.get("imageLinks", {}).get("smallThumbnail", "")
+        image_large = info.get("imageLinks", {}).get("thumbnail", "")
+        country = sale.get("country", "")
+        list_price_amount = sale.get("listPrice", {}).get("amount", "")
+        list_price_currency = sale.get("listPrice", {}).get("currencyCode", "")
+        buy_link = sale.get("buyLink", "")
+        web_reader_link = access.get("webReaderLink", "")
+        embeddable = access.get("embeddable", "")
+
+        book_data.append([
+            title, authors, publisher, published_date, description,
+            isbn_10, isbn_13,
+            reading_mode_text, reading_mode_image, page_count,
+            categories, maturity_rating,
+            image_small, image_large,
+            language, country,
+            list_price_amount, list_price_currency,
+            buy_link, web_reader_link, embeddable,
+            grade
+        ])
+
+        # Add identifiers to prevent future duplicates
+        if title_key:
+            existing_identifiers.add(title_key)
+        if isbn_10:
+            existing_identifiers.add(isbn_10)
+        if isbn_13:
+            existing_identifiers.add(isbn_13)
+
+    return book_data
+
+def save_to_csv(data, filename):
+    headers = [
+        "title", "authors", "publisher", "published_date", "description",
+        "isbn_10", "isbn_13",
+        "reading_mode_text", "reading_mode_image", "page_count",
+        "categories", "maturity_rating",
+        "image_small", "image_large",
+        "language", "sale_country",
+        "list_price_amount", "list_price_currency",
+        "buy_link", "web_reader_link", "embeddable",
+        "grade"
+    ]
+    with open(filename, mode='w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(headers)
+        writer.writerows(data)
+
+# Step 2: Fetch books per grade level
+all_new_books = []
+for grade, query in GRADE_QUERIES.items():
+    print(f"Searching for more Grade {grade} books...")
+    all_new_books.extend(fetch_books(query, grade))
+    time.sleep(60)  # Respect API rate limits
+
+save_to_csv(all_new_books, NEW_FILE)
+print(f"New books saved to {NEW_FILE}")
+
+```
