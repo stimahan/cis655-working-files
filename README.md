@@ -1126,7 +1126,7 @@ bq_client = bigquery.Client()
 conn = psycopg2.connect(
     dbname="book_recommendations_db",
     user="postgres",
-    password="stimac-cis655-final",
+    password="pass",
     host="127.0.0.1",
     port="5432"
 )
@@ -1556,7 +1556,7 @@ gcloud run deploy book-api \
   --region us-central1 \
   --allow-unauthenticated \
   --add-cloudsql-instances book-recommendations-456120:us-central1:book-recs-db \
-  --set-env-vars DB_NAME=book_recommendations_db,DB_USER=postgres,DB_PASSWORD=stimac-cis655-final,INSTANCE_CONNECTION_NAME=book-recommendations-456120:us-central1:book-recs-db \
+  --set-env-vars DB_NAME=book_recommendations_db,DB_USER=postgres,DB_PASSWORD=pass,INSTANCE_CONNECTION_NAME=book-recommendations-456120:us-central1:book-recs-db \
   --port 8080
 ```
 
@@ -1670,7 +1670,7 @@ from google.cloud import storage
 import psycopg2
 
 DB_USER = "postgres"
-DB_PASS = "stimac-cis655-final"
+DB_PASS = "pass"
 DB_NAME = "book_recommendations_db"
 DB_HOST = "/cloudsql/book-recommendations-456120:us-central1:book-recs-db"
 
@@ -1792,7 +1792,7 @@ import requests
 import csv
 import time
 
-API_KEY = "AIzaSyAF9e-dplvn7hy3ObmK60XV-cpht4pMeeY"
+API_KEY = "key"
 
 GRADE_QUERIES = {
     "K": "kindergarten books",
@@ -1902,7 +1902,7 @@ import csv
 import time
 import os
 
-API_KEY = "AIzaSyAF9e-dplvn7hy3ObmK60XV-cpht4pMeeY"
+API_KEY = "key"
 
 GRADE_QUERIES = {
     "K": "kindergarten books",
